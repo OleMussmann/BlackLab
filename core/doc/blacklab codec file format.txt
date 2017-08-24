@@ -1,0 +1,26 @@
+BL CODEC FILES
+
+fields - where to find information about each field
+- number of fields (int)
+- For each field:
+  * field name (str)
+  * offset of field in termindex file (long)
+
+termindex - where to find term strings
+- For each field:
+  * Number of terms (long)
+  * For each term:
+    - offset of term string in terms file (long)
+
+terms - term strings
+- For each field:
+  * For each term:
+    - Term string (str)
+
+termvec - occurrences of terms in documents
+- For each field:
+  * For each term:
+    - For each doc:
+      * Number of occurrences (int n)
+      - For each occurrence:
+        * Position (int)
