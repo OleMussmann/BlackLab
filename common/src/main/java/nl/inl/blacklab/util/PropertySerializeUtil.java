@@ -1,4 +1,4 @@
-package nl.inl.blacklab.resultproperty;
+package nl.inl.blacklab.util;
 
 /**
  * Takes care of serializing/deserializing Hit/DocProperties and -Values with
