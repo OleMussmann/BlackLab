@@ -216,7 +216,7 @@ public abstract class HitProperty implements ResultProperty<Hit>, LongComparator
      * @param hitIndex hit to get the sort value
      * @return the sort value
      */
-    public String getSortValue(long hitIndex) {
+    public String[] getSortValue(long hitIndex) {
         return get(hitIndex).getSortValue();
     }
 
@@ -290,7 +290,7 @@ public abstract class HitProperty implements ResultProperty<Hit>, LongComparator
         List<Annotation> contextsNeeded = needsContext();
         HitProperty result;
         if (contextsNeeded != null) {
-            List<FiidLookup> fiidLookups = FiidLookup.getList(contextsNeeded, hits.index().reader(), !hits.hasAscendingLuceneDocIds());
+            List<FiidLookup> fiidLookups = FiidLookup.getList(contextsNeeded, hits.index().reader());
             Contexts contexts = new Contexts(hits, contextsNeeded, needsContextSize(hits.index()), fiidLookups);
             result = copyWith(hits, contexts, false);
         } else {

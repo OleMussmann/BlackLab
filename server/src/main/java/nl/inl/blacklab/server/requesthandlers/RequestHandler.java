@@ -28,6 +28,7 @@ import nl.inl.blacklab.exceptions.InvalidQuery;
 import nl.inl.blacklab.instrumentation.RequestInstrumentationProvider;
 import nl.inl.blacklab.resultproperty.DocGroupProperty;
 import nl.inl.blacklab.resultproperty.DocProperty;
+import nl.inl.blacklab.resultproperty.HitProperty;
 import nl.inl.blacklab.search.BlackLabIndex;
 import nl.inl.blacklab.search.Concordance;
 import nl.inl.blacklab.search.ConcordanceType;
@@ -938,6 +939,27 @@ public abstract class RequestHandler {
                 return new InternalServerError("Internal error while searching", "INTERR_WHILE_SEARCHING", e1);
             }
         }
+    }
+
+    public void datastreamHitsAggregator(DataStream ds, Hits hits, HitProperty sortedBy) {
+        if (sortedBy != null)
+            sortedBy = sortedBy.copyWith(hits);
+        long i = 0;
+        ds.startEntry("hits").startList();
+        for (Hit hit : hits) {
+            ds.startItem("h").startList();
+            {
+                ds.item("i", hit.doc()); // NOT the PID, the Lucene doc id (only used to keep hits together)
+                if (sortedBy != null) {
+                    ds.startItem("s");
+                    ds.list("v", sortedBy.getSortValue(i));
+                    ds.endItem();
+                }
+            }
+            ds.endList().endItem();
+            i++;
+        }
+        ds.endList().endEntry();
     }
 
     public void datastreamHits(DataStream ds, Hits hits, Map<Integer, Document> luceneDocs,
