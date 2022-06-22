@@ -2,6 +2,7 @@ package nl.inl.blacklab.codec;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -10,10 +11,16 @@ import java.util.Map.Entry;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.FieldsConsumer;
+import org.apache.lucene.codecs.FieldsProducer;
+import org.apache.lucene.codecs.NormsProducer;
 import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.Fields;
 import org.apache.lucene.index.IndexFileNames;
+import org.apache.lucene.index.MappedMultiFields;
+import org.apache.lucene.index.MergeState;
+import org.apache.lucene.index.MultiFields;
 import org.apache.lucene.index.PostingsEnum;
+import org.apache.lucene.index.ReaderSlice;
 import org.apache.lucene.index.SegmentWriteState;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
@@ -21,6 +28,8 @@ import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.util.BytesRef;
+
+import nl.inl.blacklab.exceptions.BlackLabRuntimeException;
 
 /**
  * BlackLab FieldsConsumer: writes postings information to the index,
@@ -33,8 +42,27 @@ public class BLFieldsConsumer extends FieldsConsumer {
 
     protected static final Logger logger = LogManager.getLogger(BLFieldsConsumer.class);
 
+    /** Extension for the fields file. This stores the annotated field name and the offset
+        in the term index file where the term offsets ares stored.*/
+    private static final String FIELDS_EXT = "fields";
+
+    /** Extension for the term index file, that stores the offset in the terms file where
+        the term strings start for each term (in each annotated field). */
+    private static final String TERMINDEX_EXT = "termindex";
+
+    /** Extension for the terms file, where the term strings are stored. */
     private static final String TERMS_EXT = "terms";
 
+    /** Extension for the tokens index file, that stores the offsets in the tokens file
+        where the tokens for each document are stored. */
+    private static final String TOKENS_INDEX_EXT = "tokensindex";
+
+    /** Extension for the tokens file, where a term id is stored for each position in each document. */
+    private static final String TOKENS_EXT = "tokens";
+
+    /** Extension for the temporary term vector file that will be converted later.
+     * The term vector file contains the occurrences for each term in each doc (and each annotated field)
+     */
     private static final String TERMVEC_TMP_EXT = "termvec.tmp";
 
     /** The FieldsConsumer we're adapting and delegating some requests to. */
@@ -70,8 +98,12 @@ public class BLFieldsConsumer extends FieldsConsumer {
      * Merges in the fields from the readers in <code>mergeState</code>.
      *
      * Identical to {@link FieldsConsumer#merge}, essentially cancelling the delegate's
-     * own merge method, e.g.
-     * {@link org.apache.lucene.codecs.perfield.PerFieldPostingsFormat.FieldsWriter#merge(org.apache.lucene.index.MergeState, org.apache.lucene.codecs.NormsProducer)}.
+     * own merge method, e.g. FieldsWriter#merge in
+     * {@link org.apache.lucene.codecs.perfield.PerFieldPostingsFormat}}.
+     *
+     * As suggested by the name and above comments, this seems to be related to segment merging.
+     * Notice the call to write() at the end of the method, writing the merged segment to disk.
+     *
      * (not sure why this is done; presumably the overridden merge method caused problems?
      * the javadoc for FieldsConsumer's version does mention that subclasses can provide more sophisticated
      * merging; maybe that interferes with this FieldsConsumer's customizations?)
@@ -99,6 +131,18 @@ public class BLFieldsConsumer extends FieldsConsumer {
         write(mergedFields, norms);
     }
 
+    /**
+     * Called by Lucene to write fields, terms and postings.
+     *
+     * Seems to be called whenever a segment is written, either initially or after
+     * a segment merge.
+     *
+     * Delegates to the default fields consumer, but also uses the opportunity
+     * to write our forward index.
+     *
+     * @param fields fields to write
+     * @param norms norms (not used by us)
+     */
     @Override
     public void write(Fields fields, NormsProducer norms) throws IOException {
         delegateFieldsConsumer.write(fields, norms);
@@ -123,48 +167,46 @@ public class BLFieldsConsumer extends FieldsConsumer {
     private void write(FieldInfos fieldInfos, Fields fields) {
 
         // Write our postings extension information
-        FieldInfos fieldInfos = state.fieldInfos;
-        IndexOutput fieldsFile = null;
-        IndexOutput termIndexFile = null;
-        try {
-            fieldsFile = openOutputFile("fields");
-            termIndexFile = openOutputFile("termindex");
+        try (IndexOutput fieldsFile = openOutputFile(FIELDS_EXT);
+                IndexOutput termIndexFile = openOutputFile(TERMINDEX_EXT);
+                IndexOutput termsFile = openOutputFile(TERMS_EXT)) {
+
+            // We'll keep track of doc lengths so we can preallocate our forward index structure.
+            Map<Integer, Integer> docLengths = new HashMap<Integer, Integer>();
 
             // First we write a temporary dump of the term vector, and keep track of
             // where we can find term occurrences per document so we can reverse this
             // file later.
+            // (we iterate per field & term first, because that is how Lucene's reverse
+            //  index stores the information. What we need is per field, then per document
+            //  (we're trying to reconstruct the document), so we will do that below.
+            //   we use temporary files because this might take a huge amount of memory)
             Map<String, Map<Integer, List<Long>>> docPosOffsetsPerField = new HashMap<>();
-            IndexOutput tempTermVectorFile = null;
-            IndexOutput termsFile = null;
-            try {
-                tempTermVectorFile = openOutputFile(TERMVEC_TMP_EXT);
-                termsFile = openOutputFile(TERMS_EXT);
+            try (IndexOutput tempTermVectorFile = openOutputFile(TERMVEC_TMP_EXT)) {
+
                 tempTermVectorFile.writeString(delegatePostingsFormatName);
+                fieldsFile.writeInt(countAnnotationFields(fields));
 
-                // For each field...
-                fieldsFile.writeInt(fields.size());
-                for (String field: fields) {
+                // Process fields
+                for (String field: fields) { // for each field
+                    // If it's (part of) an annotated field...
+                    // TODO: we probably only want to create a forward index for one "alternative"
+                    //   of each annotation; the case/accent-sensitive one if it exists.
                     Terms terms = fields.terms(field);
-                    if (terms == null)
-                        continue;
+                    if (isAnnotationField(terms)) {
 
-                    // See what attached information this field has
-                    boolean hasPositions = terms.hasPositions();
-                    boolean hasFreqs = terms.hasFreqs();
-    //                FieldInfo fieldInfo = fieldInfos.fieldInfo(field);
-    //                boolean hasPayloads = fieldInfo.hasPayloads();
-    //                boolean hasOffsets = terms.hasOffsets();
-
-                    // If it's (part of) a complex field...
-                    if (hasFreqs && hasPositions) {
-
-                        // Record field name, offset into term index file, number of terms
+                        // Record field name and offset into term index file (in the fields file)
                         fieldsFile.writeString(field);
                         fieldsFile.writeLong(termIndexFile.getFilePointer());
+
+                        // Record number of terms (in the term index file at the above offset)
                         termIndexFile.writeLong(terms.size());
 
                         // Keep track of where to find term positions for each document
                         // (for reversing index)
+                        // The map is keyed by docId and stores a list of offsets into the
+                        // temporary termvector file where the occurrences for each term can be
+                        // found.
                         Map<Integer, List<Long>> docPosOffsets = docPosOffsetsPerField.get(field);
                         if (docPosOffsets == null) {
                             docPosOffsets = new HashMap<>();
@@ -199,67 +241,90 @@ public class BLFieldsConsumer extends FieldsConsumer {
                                 // For each occurrence of term in this doc...
                                 int nOccurrences = postingsEnum.freq();
                                 tempTermVectorFile.writeInt(nOccurrences);
+                                int docLength = docLengths.getOrDefault(docId, 0);
                                 for (int i = 0; i < nOccurrences; i++) {
-                                    tempTermVectorFile.writeInt(postingsEnum.nextPosition());
+                                    int position = postingsEnum.nextPosition();
+                                    if (position >= docLength)
+                                        docLength = position + 1;
+                                    tempTermVectorFile.writeInt(position);
                                 }
+                                docLengths.put(docId, docLength);
                             }
                         }
                         // Store additional metadata about this field
                         fieldInfos.fieldInfo(field).putAttribute("funFactsAboutField", "didYouKnowThat?");
                     }
                 }
-            } finally {
-                if (termsFile != null)
-                    termsFile.close();
-                if (tempTermVectorFile != null)
-                    tempTermVectorFile.close();
             }
+
             // Reverse the reverse index to create forward index
-            IndexInput inTermVectorFile = null;
-            try {
-                inTermVectorFile = openInputFile(TERMVEC_TMP_EXT);
-                inTermsFile = openInputFile(TERMS_EXT);
+            // (this time we iterate per field and per document first, then reconstruct the document by
+            //  looking at each term's occurrences. This produces our forward index)
+            try (IndexInput inTermVectorFile = openInputFile(TERMVEC_TMP_EXT);
+                    IndexOutput outTokensIndexFile = openOutputFile(TOKENS_INDEX_EXT);
+                    IndexOutput outTokensFile = openOutputFile(TOKENS_EXT)) {
+
+                // For each field...
                 for (Entry<String, Map<Integer, List<Long>>> fieldEntry: docPosOffsetsPerField.entrySet()) {
                     String field = fieldEntry.getKey();
                     Map<Integer, List<Long>> docPosOffsets = fieldEntry.getValue();
+                    // For each document...
                     for (Entry<Integer, List<Long>> docEntry: docPosOffsets.entrySet()) {
                         Integer docId = docEntry.getKey();
                         List<Long> termPosOffsets = docEntry.getValue();
+                        int docLength = docLengths.get(docId);
+                        int[] tokensInDoc = new int[docLength]; // reconstruct the document here
+                        Arrays.fill(tokensInDoc, -1); // initialize to illegal value
+                        // For each term...
+                        int termId = 0;
                         for (Long offset: termPosOffsets) {
-                            inTermsFile.seek(offset);
-                            Integer docId = postingsEnum.nextDoc();
-                            if (docId.equals(DocIdSetIterator.NO_MORE_DOCS))
-                                break;
-
-                            // Keep track of term positions offsets in term vector file
-                            List<Long> vectorFileOffsets = docPosOffsets.get(docId);
-                            if (vectorFileOffsets == null) {
-                                vectorFileOffsets = new ArrayList<>();
-                                docPosOffsets.put(docId, vectorFileOffsets);
-                            }
-                            vectorFileOffsets.add(tempTermVectorFile.getFilePointer());
-
-                            // For each occurrence of term in this doc...
-                            int nOccurrences = postingsEnum.freq();
-                            tempTermVectorFile.writeInt(nOccurrences);
+                            inTermVectorFile.seek(offset);
+                            int nOccurrences = inTermVectorFile.readInt();
+                            // For each occurrence...
                             for (int i = 0; i < nOccurrences; i++) {
-                                tempTermVectorFile.writeInt(postingsEnum.nextPosition());
+                                int position = inTermVectorFile.readInt();
+                                tokensInDoc[position] = termId;
                             }
+                            termId++;
+                        }
+                        // Write the forward index for this document (reconstructed doc)
+                        outTokensIndexFile.writeLong(outTokensFile.getFilePointer());
+                        outTokensFile.writeInt(docLength);
+                        for (int token: tokensInDoc) { // loop may be slow, writeBytes..? endianness, etc.?
+                            outTokensFile.writeInt(token);
                         }
                     }
-                    // Store additional metadata about this field
-                    fieldInfos.fieldInfo(field).putAttribute("funFactsAboutField", "didYouKnowThat?");
                 }
-            } finally {
-                if (inTermVectorFile != null)
-                    inTermVectorFile.close();
             }
-        } finally {
-            if (termIndexFile != null)
-                termIndexFile.close();
-            if (fieldsFile != null)
-                fieldsFile.close();
+        } catch (IOException e) {
+            throw new BlackLabRuntimeException(e);
         }
+    }
+
+    /**
+     * Determine number of fields that are (part of) annotated fields.
+     *
+     * @param fields all fields
+     * @return number of fields with annotations
+     * @throws IOException
+     */
+    private int countAnnotationFields(Fields fields) throws IOException {
+        int nAnnotatedFields = 0;
+        for (String field: fields) {
+            Terms terms = fields.terms(field);
+            if (isAnnotationField(terms))
+                nAnnotatedFields++;
+        }
+        return nAnnotatedFields;
+    }
+
+    private Boolean isAnnotationField(Terms terms) throws IOException {
+        if (terms == null)
+            return false;
+        boolean hasPositions = terms.hasPositions();
+        boolean hasFreqs = terms.hasFreqs();
+        boolean isAnnotation = hasFreqs && hasPositions;
+        return isAnnotation;
     }
 
     protected IndexOutput openOutputFile(String ext) throws IOException {
